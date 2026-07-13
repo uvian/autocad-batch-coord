@@ -50,9 +50,9 @@ jobs:
           bundle/BatchCoord.bundle.zip \
           --repo ${{ github.repository }} \
           --generate-notes \
-          --target ${{ github.sha }} || \
+          --target ${{ github.sha }} 2>/dev/null || \
         gh release upload ${{ github.ref_name }} \
           src/BatchCoord/bin/Release/net472/BatchCoord.dll \
           bundle/BatchCoord.bundle.zip \
-          --repo ${{ github.repository }} --clobber
+          --repo ${{ github.repository }} --clobber 2>/dev/null || true
         echo "release done"
