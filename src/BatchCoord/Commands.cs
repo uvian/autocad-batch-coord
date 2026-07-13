@@ -18,43 +18,43 @@ namespace BatchCoord
             var db = doc.Database;
             var ed = doc.Editor;
 
-            ed.WriteMessage("\n=== 自动坐标标注 ZDZB ===");
+            ed.WriteMessage("\n=== 自动坐标标注 ZDZB ===\n");
 
             try
             {
-                // 1. 选择要标注的多段线
+                // ── 1. 选择闭合多段线（地块） ──
                 var selOpts = new PromptSelectionOptions();
                 selOpts.MessageForAdding = "\n选择要标注坐标的地块（闭合多段线）: ";
                 var filter = new SelectionFilter(new[] { new TypedValue(0, "LWPOLYLINE") });
                 var selRes = ed.GetSelection(selOpts, filter);
-                if (selRes.Status != PromptStatus.OK) { ed.WriteMessage("\n已取消。"); return; }
+                if (selRes.Status != PromptStatus.OK) { ed.WriteMessage("已取消。\n"); return; }
 
-                // 2. 指定标注文字约束范围（矩形边界，坐标标注不超出此范围）
-                ed.WriteMessage("\n指定坐标标注的约束范围 — 文字不会超出此矩形。");
+                // ── 2. 矩形约束范围（标注不超出此框） ──
+                ed.WriteMessage("\n指定坐标标注的约束范围 — 标注不超出此矩形。\n");
                 var pt1Res = ed.GetPoint(new PromptPointOptions("\n第一角点: "));
-                if (pt1Res.Status != PromptStatus.OK) { ed.WriteMessage("\n已取消。"); return; }
+                if (pt1Res.Status != PromptStatus.OK) { ed.WriteMessage("已取消。\n"); return; }
                 var pt2Res = ed.GetCorner(new PromptCornerOptions("\n对角点: ", pt1Res.Value));
-                if (pt2Res.Status != PromptStatus.OK) { ed.WriteMessage("\n已取消。"); return; }
+                if (pt2Res.Status != PromptStatus.OK) { ed.WriteMessage("已取消。\n"); return; }
 
                 double bMinX = Math.Min(pt1Res.Value.X, pt2Res.Value.X);
                 double bMinY = Math.Min(pt1Res.Value.Y, pt2Res.Value.Y);
                 double bMaxX = Math.Max(pt1Res.Value.X, pt2Res.Value.X);
                 double bMaxY = Math.Max(pt1Res.Value.Y, pt2Res.Value.Y);
 
-                // 3. 小数位数
+                // ── 3. 小数位数 ──
                 int decimals = 3;
                 var decRes = ed.GetInteger(new PromptIntegerOptions("\n小数位数 <3>: ")
                 { AllowNegative = false, AllowZero = false, DefaultValue = 3, LowerLimit = 0, UpperLimit = 6 });
                 if (decRes.Status == PromptStatus.OK) decimals = decRes.Value;
 
-                // 4. 图纸比例 & 字高
+                // ── 4. 字高 ──
                 double dimScale = GetDimScale(db);
                 double defaultTextH = dimScale * 2.5;
                 var htRes = ed.GetDouble(new PromptDoubleOptions($"\n字高 [回车={defaultTextH:F1}]: ")
                 { AllowNegative = false, AllowZero = false, DefaultValue = defaultTextH });
                 double textHeight = htRes.Status == PromptStatus.OK ? htRes.Value : defaultTextH;
 
-                // 5. 提取顶点
+                // ── 5. 提取顶点 ──
                 var allVerts = new List<VertexInfo>();
                 using (var tr = db.TransactionManager.StartTransaction())
                 {
@@ -67,13 +67,13 @@ namespace BatchCoord
                     tr.Commit();
                 }
 
-                if (allVerts.Count == 0) { ed.WriteMessage("\n未选中有效的闭合多段线。"); return; }
-                ed.WriteMessage($"\n共 {allVerts.Count} 个角点，正在计算最优标注位置...");
+                if (allVerts.Count == 0) { ed.WriteMessage("未选中有效的闭合多段线。\n"); return; }
+                ed.WriteMessage($"共 {allVerts.Count} 个角点，正在计算最优标注位置...");
 
-                // 6. 碰撞检测 + 放置（文字被约束在 bMinX~bMaxX, bMinY~bMaxY 内）
+                // ── 6. 碰撞检测 + 放置 ──
                 var placedLabels = PlaceLabels(allVerts, textHeight, decimals, bMinX, bMinY, bMaxX, bMaxY);
 
-                // 7. 生成标注
+                // ── 7. 生成标注实体 ──
                 int placed = 0;
                 using (var tr = db.TransactionManager.StartTransaction())
                 {
@@ -139,23 +139,24 @@ namespace BatchCoord
 
         #endregion
 
-        #region 碰撞检测
+        #region 碰撞检测与放置
 
         private class PlacedLabel
         {
             public Point2d Anchor { get; set; }
-            public Point2d TextPos { get; set; }
+            /// <summary>水平线中心点（引线末端位置）</summary>
+            public Point2d LandingCenter { get; set; }
+            /// <summary>标注整体包围盒</summary>
             public double BoxMinX { get; set; }
             public double BoxMinY { get; set; }
             public double BoxMaxX { get; set; }
             public double BoxMaxY { get; set; }
-            public bool InsidePolygon { get; set; }
+            public bool IsInsidePolygon { get; set; }
         }
 
         private class GridCell
         {
             public List<double> Boxes { get; } = new List<double>();
-            // Stores as flat array: [minX, minY, maxX, maxY, ...]
             public void Add(double minX, double minY, double maxX, double maxY)
             {
                 Boxes.Add(minX); Boxes.Add(minY); Boxes.Add(maxX); Boxes.Add(maxY);
@@ -165,80 +166,112 @@ namespace BatchCoord
         private List<PlacedLabel> PlaceLabels(List<VertexInfo> verts, double textH, int decimals,
             double bMinX, double bMinY, double bMaxX, double bMaxY)
         {
-            var dirs = new[]
-            {
-                new Vector2d(1, 1).GetNormal(),
-                new Vector2d(1, -1).GetNormal(),
-                new Vector2d(-1, 1).GetNormal(),
-                new Vector2d(-1, -1).GetNormal(),
-                new Vector2d(1, 0).GetNormal(),
-                new Vector2d(0, 1).GetNormal(),
-                new Vector2d(-1, 0).GetNormal(),
-                new Vector2d(0, -1).GetNormal(),
-            };
+            // 计算文字及水平线尺寸
+            string fmt = $"F{decimals}";
+            double charW = textH * 0.7;   // 等宽字宽 ≈ 字高×0.7
+            double pad = textH * 0.15;    // 文字与水平线的间距
 
-            double cw = textH * 0.7;
-            string sample = $"X={new string('9', 6)}";
-            double lblW = sample.Length * cw;
-            double lblH = textH * 2.8;
-            double baseOff = lblH * 0.5;
-            double cellSz = lblW * 1.5;
+            // 用最大值估算线宽（每个坐标至少一个样本长度）
+            double sample = Math.Pow(10, decimals) * 2; // 足够覆盖坐标长度
+            string sampleX = $"X={sample.ToString(fmt)}";
+            string sampleY = $"Y={sample.ToString(fmt)}";
+            double lineW = Math.Max(sampleX.Length, sampleY.Length) * charW + charW;
+            double halfW = lineW * 0.5;
+
+            // 标注总高：上方X文字 + 间距 + 下方Y文字
+            double totalH = textH + pad + textH;
+
+            double cellSz = Math.Max(lineW, totalH) * 1.2;
+
+            // 16 方向候选
+            var dirs = new Vector2d[16];
+            for (int i = 0; i < 16; i++)
+            {
+                double ang = i * Math.PI / 8;
+                dirs[i] = new Vector2d(Math.Cos(ang), Math.Sin(ang));
+            }
+
             var grid = new Dictionary<string, GridCell>();
             var results = new List<PlacedLabel>();
 
-            var sorted = verts.Select((v, i) => new { v, dist = v.Point.GetDistanceTo(v.Centroid) })
+            // 按距离形心从远到近排序（外部角点优先放置）
+            var sorted = verts.Select(v => new { v, dist = v.Point.GetDistanceTo(v.Centroid) })
                               .OrderByDescending(x => x.dist).ToList();
 
             foreach (var item in sorted)
             {
                 var v = item.v;
                 bool placed = false;
-                var best = v.OutwardDir;
-                var sortedDirs = dirs.Select((d, i) => new { d, i, dot = d.X * best.X + d.Y * best.Y })
-                                     .OrderByDescending(x => x.dot).ToList();
 
-                for (int dl = 0; dl < 4 && !placed; dl++)
+                // 按与 OutwardDir 的匹配度排序方向
+                var sortedDirs = dirs.Select(d => new
                 {
-                    double off = baseOff * (1 + dl * 0.8);
+                    dir = d,
+                    score = d.X * v.OutwardDir.X + d.Y * v.OutwardDir.Y
+                }).OrderByDescending(x => x.score).ToList();
+
+                for (int layer = 0; layer < 8 && !placed; layer++)
+                {
+                    double offset = textH + layer * textH * 0.9;
+
                     foreach (var sd in sortedDirs)
                     {
-                        var tp = new Point2d(v.Point.X + sd.d.X * off, v.Point.Y + sd.d.Y * off);
+                        var landing = new Point2d(
+                            v.Point.X + sd.dir.X * offset,
+                            v.Point.Y + sd.dir.Y * offset);
 
-                        // 文字必须落在约束矩形内
-                        if (tp.X < bMinX || tp.X > bMaxX ||
-                            tp.Y < bMinY || tp.Y > bMaxY)
+                        // 水平线中心必须在约束矩形内
+                        if (landing.X < bMinX + halfW || landing.X > bMaxX - halfW ||
+                            landing.Y < bMinY - textH - pad || landing.Y > bMaxY + textH + pad)
                             continue;
 
-                        double bx = sd.d.X > 0 ? tp.X : tp.X - lblW;
-                        double by = sd.d.Y > 0 ? tp.Y : tp.Y - lblH;
-                        double ex = bx + lblW;
-                        double ey = by + lblH;
+                        // 包围盒
+                        double bx = landing.X - halfW;
+                        double by = landing.Y - textH - pad;
+                        double ex = landing.X + halfW;
+                        double ey = landing.Y + textH + pad;
 
-                        if (CheckCollision(grid, bx, by, ex, ey, cellSz)) continue;
+                        if (CheckCollision(grid, bx, by, ex, ey, cellSz))
+                            continue;
+
                         AddToGrid(grid, bx, by, ex, ey, cellSz);
                         results.Add(new PlacedLabel
                         {
-                            Anchor = v.Point, TextPos = tp,
+                            Anchor = v.Point,
+                            LandingCenter = landing,
                             BoxMinX = bx, BoxMinY = by, BoxMaxX = ex, BoxMaxY = ey,
-                            InsidePolygon = false
+                            IsInsidePolygon = false
                         });
                         placed = true;
                         break;
                     }
                 }
 
+                // 后备：多边形内部放置
                 if (!placed)
                 {
                     var inward = (v.Centroid - v.Point).GetNormal();
-                    var tp = new Point2d(v.Point.X + inward.X * lblH * 0.3, v.Point.Y + inward.Y * lblH * 0.3);
-                    double bx = tp.X - lblW * 0.5, by = tp.Y - lblH * 0.5;
-                    double ex = bx + lblW, ey = by + lblH;
+                    var landing = new Point2d(
+                        v.Point.X + inward.X * textH * 0.4,
+                        v.Point.Y + inward.Y * textH * 0.4);
+
+                    // 如果后备点也在约束框外，强制拉入
+                    landing = new Point2d(
+                        Math.Max(bMinX + halfW, Math.Min(bMaxX - halfW, landing.X)),
+                        Math.Max(bMinY + textH + pad, Math.Min(bMaxY - textH - pad, landing.Y)));
+
+                    double bx = landing.X - halfW;
+                    double by = landing.Y - textH - pad;
+                    double ex = landing.X + halfW;
+                    double ey = landing.Y + textH + pad;
+
                     AddToGrid(grid, bx, by, ex, ey, cellSz);
                     results.Add(new PlacedLabel
                     {
-                        Anchor = v.Point, TextPos = tp,
+                        Anchor = v.Point,
+                        LandingCenter = landing,
                         BoxMinX = bx, BoxMinY = by, BoxMaxX = ex, BoxMaxY = ey,
-                        InsidePolygon = true
+                        IsInsidePolygon = true
                     });
                 }
             }
@@ -295,44 +328,71 @@ namespace BatchCoord
         private void CreateCoordAnnotation(Transaction tr, BlockTableRecord ms,
             PlacedLabel label, double textH, int decimals)
         {
-            var anchor3d = new Point3d(label.Anchor.X, label.Anchor.Y, 0);
-            var textPos3d = new Point3d(label.TextPos.X, label.TextPos.Y, 0);
-
-            // 1. 角点标记圆
-            var dot = new Circle();
-            dot.Center = anchor3d;
-            dot.Normal = Vector3d.ZAxis;
-            dot.Radius = textH * 0.08;
-            dot.ColorIndex = 2;
-            ms.AppendEntity(dot);
-            tr.AddNewlyCreatedDBObject(dot, true);
-
-            // 2. 引线（折线）
-            if (!label.InsidePolygon)
-            {
-                var leader = new Polyline();
-                leader.AddVertexAt(0, label.Anchor, 0, 0, 0);
-                double mx = (label.Anchor.X + label.TextPos.X) * 0.5;
-                double my = (label.Anchor.Y + label.TextPos.Y) * 0.5;
-                leader.AddVertexAt(1, new Point2d(mx, my), 0, 0, 0);
-                leader.AddVertexAt(2, label.TextPos, 0, 0, 0);
-                leader.ColorIndex = 2;
-                ms.AppendEntity(leader);
-                tr.AddNewlyCreatedDBObject(leader, true);
-            }
-
-            // 3. 坐标文字
             string fmt = $"F{decimals}";
             string coordX = $"X={label.Anchor.X.ToString(fmt)}";
             string coordY = $"Y={label.Anchor.Y.ToString(fmt)}";
-            var mtext = new MText();
-            mtext.Contents = coordX + "\\P" + coordY;
-            mtext.TextHeight = textH;
-            mtext.Location = textPos3d;
-            mtext.Attachment = AttachmentPoint.MiddleCenter;
-            mtext.ColorIndex = 2;
-            ms.AppendEntity(mtext);
-            tr.AddNewlyCreatedDBObject(mtext, true);
+
+            double charW = textH * 0.7;
+            double lineW = Math.Max(coordX.Length, coordY.Length) * charW;
+            double halfW = lineW * 0.5;
+            double pad = textH * 0.15;
+
+            var anchor3d = new Point3d(label.Anchor.X, label.Anchor.Y, 0);
+            var landing3d = new Point3d(label.LandingCenter.X, label.LandingCenter.Y, 0);
+
+            // ── 1. 测量点小圆点 ──
+            var dot = new Circle
+            {
+                Center = anchor3d,
+                Normal = Vector3d.ZAxis,
+                Radius = textH * 0.08,
+                ColorIndex = 2
+            };
+            ms.AppendEntity(dot);
+            tr.AddNewlyCreatedDBObject(dot, true);
+
+            // ── 2. 引线（直线，从锚点 → 水平线中心） ──
+            // 使用 Line 而非 Polyline，结构更简单
+            var leader = new Line(anchor3d, landing3d)
+            {
+                ColorIndex = 2
+            };
+            ms.AppendEntity(leader);
+            tr.AddNewlyCreatedDBObject(leader, true);
+
+            // ── 3. 水平线 ──
+            var hLine = new Line(
+                new Point3d(label.LandingCenter.X - halfW, label.LandingCenter.Y, 0),
+                new Point3d(label.LandingCenter.X + halfW, label.LandingCenter.Y, 0))
+            {
+                ColorIndex = 2
+            };
+            ms.AppendEntity(hLine);
+            tr.AddNewlyCreatedDBObject(hLine, true);
+
+            // ── 4. X = 坐标值（水平线上方） ──
+            var xMText = new MText
+            {
+                Contents = coordX,
+                TextHeight = textH,
+                Location = new Point3d(label.LandingCenter.X, label.LandingCenter.Y + pad, 0),
+                Attachment = AttachmentPoint.BottomCenter,
+                ColorIndex = 2
+            };
+            ms.AppendEntity(xMText);
+            tr.AddNewlyCreatedDBObject(xMText, true);
+
+            // ── 5. Y = 坐标值（水平线下方） ──
+            var yMText = new MText
+            {
+                Contents = coordY,
+                TextHeight = textH,
+                Location = new Point3d(label.LandingCenter.X, label.LandingCenter.Y - pad, 0),
+                Attachment = AttachmentPoint.TopCenter,
+                ColorIndex = 2
+            };
+            ms.AppendEntity(yMText);
+            tr.AddNewlyCreatedDBObject(yMText, true);
         }
 
         #endregion
