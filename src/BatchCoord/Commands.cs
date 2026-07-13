@@ -11,7 +11,7 @@ namespace BatchCoord
 {
     public class Commands
     {
-        [CommandMethod("BATCHCOORD")]
+        [CommandMethod("ZDZB")]
         [CommandMethod("BZ")]
         public void BatchCoord()
         {
@@ -19,50 +19,71 @@ namespace BatchCoord
             var db = doc.Database;
             var ed = doc.Editor;
 
-            ed.WriteMessage("\n=== 批量坐标标注 BATCHCOORD ===");
+            ed.WriteMessage("\n=== 自动坐标标注 ZDZB ===");
 
             try
             {
-                // 1. 选择多段线
-                var selOpts = new PromptSelectionOptions();
-                selOpts.MessageForAdding = "\n选择要标注坐标的地块（闭合多段线）: ";
-                var filter = new SelectionFilter(new[] { new TypedValue(0, "LWPOLYLINE") });
-                var selRes = ed.GetSelection(selOpts, filter);
-                if (selRes.Status != PromptStatus.OK) { ed.WriteMessage("\n已取消。"); return; }
+                // 1. 选择矩形范围（边界框）
+                ed.WriteMessage("\n指定标注范围的第一角点: ");
+                var pt1Res = ed.GetPoint(new PromptPointOptions("\n指定标注范围的第一个角点: "));
+                if (pt1Res.Status != PromptStatus.OK) { ed.WriteMessage("\n已取消。"); return; }
 
-                // 2. 小数位数
+                ed.WriteMessage("\n指定对角点: ");
+                var pt2Res = ed.GetCorner(new PromptCornerOptions("\n指定对角点: ", pt1Res.Value));
+                if (pt2Res.Status != PromptStatus.OK) { ed.WriteMessage("\n已取消。"); return; }
+
+                var minX = Math.Min(pt1Res.Value.X, pt2Res.Value.X);
+                var minY = Math.Min(pt1Res.Value.Y, pt2Res.Value.Y);
+                var maxX = Math.Max(pt1Res.Value.X, pt2Res.Value.X);
+                var maxY = Math.Max(pt1Res.Value.Y, pt2Res.Value.Y);
+                var boundary = new Extents2d(minX, minY, maxX, maxY);
+
+                // 2. 选择范围内的多段线
+                var filter = new SelectionFilter(new[] { new TypedValue(0, "LWPOLYLINE") });
+                var selectionRes = ed.SelectAll(filter);
+                if (selectionRes.Status != PromptStatus.OK)
+                {
+                    ed.WriteMessage("\n图中没有可用的多段线。");
+                    return;
+                }
+
+                // 3. 小数位数
                 int decimals = 3;
                 var decRes = ed.GetInteger(new PromptIntegerOptions("\n小数位数 <3>: ")
                 { AllowNegative = false, AllowZero = false, DefaultValue = 3, LowerLimit = 0, UpperLimit = 6 });
                 if (decRes.Status == PromptStatus.OK) decimals = decRes.Value;
 
-                // 3. 图纸比例 & 字高
+                // 4. 图纸比例 & 字高
                 double dimScale = GetDimScale(db);
                 double defaultTextH = dimScale * 2.5;
                 var htRes = ed.GetDouble(new PromptDoubleOptions($"\n字高 [回车={defaultTextH:F1}]: ")
                 { AllowNegative = false, AllowZero = false, DefaultValue = defaultTextH });
                 double textHeight = htRes.Status == PromptStatus.OK ? htRes.Value : defaultTextH;
 
-                // 4. 提取顶点
+                // 5. 提取范围内的顶点
                 var allVerts = new List<VertexInfo>();
                 using (var tr = db.TransactionManager.StartTransaction())
                 {
-                    foreach (SelectedObject so in selRes.Value)
+                    foreach (SelectedObject so in selectionRes.Value)
                     {
                         var pl = tr.GetObject(so.ObjectId, OpenMode.ForRead) as Polyline;
                         if (pl == null || !pl.Closed) continue;
+
+                        // 检查多段线是否在矩形范围内（质心在内即可）
+                        if (!IsPolylineInBoundary(pl, boundary)) continue;
+
                         ExtractVertices(pl, allVerts);
                     }
                     tr.Commit();
                 }
 
-                if (allVerts.Count == 0) { ed.WriteMessage("\n未找到有效的闭合多段线。"); return; }
+                if (allVerts.Count == 0) { ed.WriteMessage("\n指定范围内未找到闭合多段线。"); return; }
                 ed.WriteMessage($"\n共 {allVerts.Count} 个角点，正在计算最优标注位置...");
 
-                // 5. 碰撞检测 + 放置
-                var placedLabels = PlaceLabels(allVerts, textHeight, decimals);
+                // 6. 碰撞检测 + 放置
+                var placedLabels = PlaceLabels(allVerts, textHeight, decimals, boundary);
 
-                // 6. 生成标注
+                // 7. 生成标注
                 int placed = 0;
                 using (var tr = db.TransactionManager.StartTransaction())
                 {
@@ -83,6 +104,24 @@ namespace BatchCoord
                 ed.WriteMessage($"\n❌ 错误: {ex.Message}");
             }
         }
+
+        #region 边界检测
+
+        private bool IsPolylineInBoundary(Polyline pl, Extents2d boundary)
+        {
+            double cx = 0, cy = 0;
+            int n = pl.NumberOfVertices;
+            for (int i = 0; i < n; i++)
+            {
+                var pt = pl.GetPoint2dAt(i);
+                cx += pt.X; cy += pt.Y;
+            }
+            cx /= n; cy /= n;
+            return cx >= boundary.MinPoint.X && cx <= boundary.MaxPoint.X &&
+                   cy >= boundary.MinPoint.Y && cy <= boundary.MaxPoint.Y;
+        }
+
+        #endregion
 
         #region 顶点提取与方向计算
 
@@ -134,11 +173,24 @@ namespace BatchCoord
         {
             public Point2d Anchor { get; set; }
             public Point2d TextPos { get; set; }
-            public Extents2d BBox { get; set; }
+            public double BoxMinX { get; set; }
+            public double BoxMinY { get; set; }
+            public double BoxMaxX { get; set; }
+            public double BoxMaxY { get; set; }
             public bool InsidePolygon { get; set; }
         }
 
-        private List<PlacedLabel> PlaceLabels(List<VertexInfo> verts, double textH, int decimals)
+        private class GridCell
+        {
+            public List<double> Boxes { get; } = new List<double>();
+            // Stores as flat array: [minX, minY, maxX, maxY, ...]
+            public void Add(double minX, double minY, double maxX, double maxY)
+            {
+                Boxes.Add(minX); Boxes.Add(minY); Boxes.Add(maxX); Boxes.Add(maxY);
+            }
+        }
+
+        private List<PlacedLabel> PlaceLabels(List<VertexInfo> verts, double textH, int decimals, Extents2d boundary)
         {
             var dirs = new[]
             {
@@ -158,7 +210,7 @@ namespace BatchCoord
             double lblH = textH * 2.8;
             double baseOff = lblH * 0.5;
             double cellSz = lblW * 1.5;
-            var grid = new Dictionary<(int, int), List<Extents2d>>();
+            var grid = new Dictionary<string, GridCell>();
             var results = new List<PlacedLabel>();
 
             var sorted = verts.Select((v, i) => new { v, dist = v.Point.GetDistanceTo(v.Centroid) })
@@ -178,12 +230,25 @@ namespace BatchCoord
                     foreach (var sd in sortedDirs)
                     {
                         var tp = new Point2d(v.Point.X + sd.d.X * off, v.Point.Y + sd.d.Y * off);
+
+                        // 文字必须落在边界矩形内
+                        if (tp.X < boundary.MinPoint.X || tp.X > boundary.MaxPoint.X ||
+                            tp.Y < boundary.MinPoint.Y || tp.Y > boundary.MaxPoint.Y)
+                            continue;
+
                         double bx = sd.d.X > 0 ? tp.X : tp.X - lblW;
                         double by = sd.d.Y > 0 ? tp.Y : tp.Y - lblH;
-                        var bbox = new Extents2d(bx, by, bx + lblW, by + lblH);
-                        if (CheckCollision(grid, bbox, cellSz)) continue;
-                        AddToGrid(grid, bbox, cellSz);
-                        results.Add(new PlacedLabel { Anchor = v.Point, TextPos = tp, BBox = bbox, InsidePolygon = false });
+                        double ex = bx + lblW;
+                        double ey = by + lblH;
+
+                        if (CheckCollision(grid, bx, by, ex, ey, cellSz)) continue;
+                        AddToGrid(grid, bx, by, ex, ey, cellSz);
+                        results.Add(new PlacedLabel
+                        {
+                            Anchor = v.Point, TextPos = tp,
+                            BoxMinX = bx, BoxMinY = by, BoxMaxX = ex, BoxMaxY = ey,
+                            InsidePolygon = false
+                        });
                         placed = true;
                         break;
                     }
@@ -193,46 +258,60 @@ namespace BatchCoord
                 {
                     var inward = (v.Centroid - v.Point).GetNormal();
                     var tp = new Point2d(v.Point.X + inward.X * lblH * 0.3, v.Point.Y + inward.Y * lblH * 0.3);
-                    var bbox = new Extents2d(tp.X - lblW * 0.5, tp.Y - lblH * 0.5, tp.X + lblW * 0.5, tp.Y + lblH * 0.5);
-                    AddToGrid(grid, bbox, cellSz);
-                    results.Add(new PlacedLabel { Anchor = v.Point, TextPos = tp, BBox = bbox, InsidePolygon = true });
+                    double bx = tp.X - lblW * 0.5, by = tp.Y - lblH * 0.5;
+                    double ex = bx + lblW, ey = by + lblH;
+                    AddToGrid(grid, bx, by, ex, ey, cellSz);
+                    results.Add(new PlacedLabel
+                    {
+                        Anchor = v.Point, TextPos = tp,
+                        BoxMinX = bx, BoxMinY = by, BoxMaxX = ex, BoxMaxY = ey,
+                        InsidePolygon = true
+                    });
                 }
             }
             return results;
         }
 
-        private bool CheckCollision(Dictionary<(int, int), List<Extents2d>> grid, Extents2d bbox, double cs)
+        private bool CheckCollision(Dictionary<string, GridCell> grid,
+            double bx, double by, double ex, double ey, double cs)
         {
-            int x0 = (int)Math.Floor(bbox.MinPoint.X / cs);
-            int x1 = (int)Math.Floor(bbox.MaxPoint.X / cs);
-            int y0 = (int)Math.Floor(bbox.MinPoint.Y / cs);
-            int y1 = (int)Math.Floor(bbox.MaxPoint.Y / cs);
+            int x0 = (int)Math.Floor(bx / cs);
+            int x1 = (int)Math.Floor(ex / cs);
+            int y0 = (int)Math.Floor(by / cs);
+            int y1 = (int)Math.Floor(ey / cs);
             for (int x = x0; x <= x1; x++)
+            {
                 for (int y = y0; y <= y1; y++)
-                    if (grid.ContainsKey((x, y)))
-                        foreach (var e in grid[(x, y)])
-                            if (Overlaps(bbox, e)) return true;
+                {
+                    string key = $"{x},{y}";
+                    if (!grid.ContainsKey(key)) continue;
+                    var cell = grid[key];
+                    var boxes = cell.Boxes;
+                    for (int i = 0; i < boxes.Count; i += 4)
+                    {
+                        if (!(ex <= boxes[i] || boxes[i + 2] <= bx ||
+                              ey <= boxes[i + 1] || boxes[i + 3] <= by))
+                            return true;
+                    }
+                }
+            }
             return false;
         }
 
-        private bool Overlaps(Extents2d a, Extents2d b)
+        private void AddToGrid(Dictionary<string, GridCell> grid,
+            double bx, double by, double ex, double ey, double cs)
         {
-            return !(a.MaxPoint.X <= b.MinPoint.X || b.MaxPoint.X <= a.MinPoint.X ||
-                     a.MaxPoint.Y <= b.MinPoint.Y || b.MaxPoint.Y <= a.MinPoint.Y);
-        }
-
-        private void AddToGrid(Dictionary<(int, int), List<Extents2d>> grid, Extents2d bbox, double cs)
-        {
-            int x0 = (int)Math.Floor(bbox.MinPoint.X / cs);
-            int x1 = (int)Math.Floor(bbox.MaxPoint.X / cs);
-            int y0 = (int)Math.Floor(bbox.MinPoint.Y / cs);
-            int y1 = (int)Math.Floor(bbox.MaxPoint.Y / cs);
+            int x0 = (int)Math.Floor(bx / cs);
+            int x1 = (int)Math.Floor(ex / cs);
+            int y0 = (int)Math.Floor(by / cs);
+            int y1 = (int)Math.Floor(ey / cs);
             for (int x = x0; x <= x1; x++)
                 for (int y = y0; y <= y1; y++)
                 {
-                    var k = (x, y);
-                    if (!grid.ContainsKey(k)) grid[k] = new List<Extents2d>();
-                    grid[k].Add(bbox);
+                    string key = $"{x},{y}";
+                    if (!grid.ContainsKey(key))
+                        grid[key] = new GridCell();
+                    grid[key].Add(bx, by, ex, ey);
                 }
         }
 
@@ -247,19 +326,22 @@ namespace BatchCoord
             var textPos3d = new Point3d(label.TextPos.X, label.TextPos.Y, 0);
 
             // 1. 角点标记圆
-            var dot = new Circle(anchor3d, Vector3d.ZAxis, textH * 0.08);
+            var dot = new Circle();
+            dot.Center = anchor3d;
+            dot.Normal = Vector3d.ZAxis;
+            dot.Radius = textH * 0.08;
             dot.ColorIndex = 2;
             ms.AppendEntity(dot);
             tr.AddNewlyCreatedDBObject(dot, true);
 
-            // 2. 引线
+            // 2. 引线（折线）
             if (!label.InsidePolygon)
             {
                 var leader = new Polyline();
                 leader.AddVertexAt(0, label.Anchor, 0, 0, 0);
-                var mid = new Point2d((label.Anchor.X + label.TextPos.X) * 0.5,
-                                      (label.Anchor.Y + label.TextPos.Y) * 0.5);
-                leader.AddVertexAt(1, mid, 0, 0, 0);
+                double mx = (label.Anchor.X + label.TextPos.X) * 0.5;
+                double my = (label.Anchor.Y + label.TextPos.Y) * 0.5;
+                leader.AddVertexAt(1, new Point2d(mx, my), 0, 0, 0);
                 leader.AddVertexAt(2, label.TextPos, 0, 0, 0);
                 leader.ColorIndex = 2;
                 ms.AppendEntity(leader);
@@ -270,15 +352,12 @@ namespace BatchCoord
             string fmt = $"F{decimals}";
             string coordX = $"X={label.Anchor.X.ToString(fmt)}";
             string coordY = $"Y={label.Anchor.Y.ToString(fmt)}";
-            var mtext = new MText
-            {
-                Contents = $"{coordX}\\P{coordY}",
-                TextHeight = textH,
-                Location = textPos3d,
-                Attachment = AttachmentPoint.MiddleCenter,
-                ColorIndex = 2
-            };
-            mtext.SetDatabaseDefaults();
+            var mtext = new MText();
+            mtext.Contents = coordX + "\\P" + coordY;
+            mtext.TextHeight = textH;
+            mtext.Location = textPos3d;
+            mtext.Attachment = AttachmentPoint.MiddleCenter;
+            mtext.ColorIndex = 2;
             ms.AppendEntity(mtext);
             tr.AddNewlyCreatedDBObject(mtext, true);
         }
