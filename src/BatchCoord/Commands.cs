@@ -168,33 +168,37 @@ namespace BatchCoord
         {
             // 计算文字及水平线尺寸
             string fmt = $"F{decimals}";
-            double charW = textH * 0.7;   // 等宽字宽 ≈ 字高×0.7
-            double pad = textH * 0.15;    // 文字与水平线的间距
+            double charW = textH * 0.7;
+            double pad = textH * 0.15;
 
-            // 用最大值估算线宽（每个坐标至少一个样本长度）
-            double sample = Math.Pow(10, decimals) * 2; // 足够覆盖坐标长度
+            double sample = Math.Pow(10, decimals) * 2;
             string sampleX = $"X={sample.ToString(fmt)}";
             string sampleY = $"Y={sample.ToString(fmt)}";
-            double lineW = Math.Max(sampleX.Length, sampleY.Length) * charW + charW;
+            double lineW = Math.Max(sampleX.Length, sampleY.Length) * charW + charW * 2;
             double halfW = lineW * 0.5;
+            double totalH = textH + pad + textH;   // 标注视觉高度
+            double minOffset = halfW + textH * 0.8; // 最小偏移：至少半个标注宽 + 间距
 
-            // 标注总高：上方X文字 + 间距 + 下方Y文字
-            double totalH = textH + pad + textH;
+            double cellSz = Math.Max(lineW, totalH) * 1.5;
 
-            double cellSz = Math.Max(lineW, totalH) * 1.2;
-
-            // 16 方向候选
-            var dirs = new Vector2d[16];
+            // 16 方向 + 4 次微调方向 = 20 方向
+            var dirs = new Vector2d[20];
             for (int i = 0; i < 16; i++)
             {
                 double ang = i * Math.PI / 8;
                 dirs[i] = new Vector2d(Math.Cos(ang), Math.Sin(ang));
             }
+            // 补充 4 个 22.5° 间的细方向
+            for (int i = 0; i < 4; i++)
+            {
+                double ang = (i * 2 + 1) * Math.PI / 8;
+                dirs[16 + i] = new Vector2d(Math.Cos(ang), Math.Sin(ang));
+            }
 
             var grid = new Dictionary<string, GridCell>();
             var results = new List<PlacedLabel>();
 
-            // 按距离形心从远到近排序（外部角点优先放置）
+            // 按距离形心从远到近排序
             var sorted = verts.Select(v => new { v, dist = v.Point.GetDistanceTo(v.Centroid) })
                               .OrderByDescending(x => x.dist).ToList();
 
@@ -203,16 +207,17 @@ namespace BatchCoord
                 var v = item.v;
                 bool placed = false;
 
-                // 按与 OutwardDir 的匹配度排序方向
+                // 按与 OutwardDir 匹配度排序方向
                 var sortedDirs = dirs.Select(d => new
                 {
                     dir = d,
                     score = d.X * v.OutwardDir.X + d.Y * v.OutwardDir.Y
                 }).OrderByDescending(x => x.score).ToList();
 
-                for (int layer = 0; layer < 8 && !placed; layer++)
+                // 试 15 层偏移，从 1×标注半宽 到 10×标注半宽
+                for (int layer = 0; layer < 15 && !placed; layer++)
                 {
-                    double offset = textH + layer * textH * 0.9;
+                    double offset = minOffset + layer * halfW * 0.8;
 
                     foreach (var sd in sortedDirs)
                     {
@@ -220,12 +225,11 @@ namespace BatchCoord
                             v.Point.X + sd.dir.X * offset,
                             v.Point.Y + sd.dir.Y * offset);
 
-                        // 水平线中心必须在约束矩形内
-                        if (landing.X < bMinX + halfW || landing.X > bMaxX - halfW ||
-                            landing.Y < bMinY - textH - pad || landing.Y > bMaxY + textH + pad)
+                        // 整个标注体必须在约束矩形内
+                        if (landing.X - halfW < bMinX || landing.X + halfW > bMaxX ||
+                            landing.Y - textH - pad < bMinY || landing.Y + textH + pad > bMaxY)
                             continue;
 
-                        // 包围盒
                         double bx = landing.X - halfW;
                         double by = landing.Y - textH - pad;
                         double ex = landing.X + halfW;
@@ -247,32 +251,81 @@ namespace BatchCoord
                     }
                 }
 
-                // 后备：多边形内部放置
+                // 后备：多边形内部 + 矩形边缘放置
                 if (!placed)
                 {
-                    var inward = (v.Centroid - v.Point).GetNormal();
-                    var landing = new Point2d(
-                        v.Point.X + inward.X * textH * 0.4,
-                        v.Point.Y + inward.Y * textH * 0.4);
+                    // 在矩形四条边上均匀采点作为后备位置
+                    var fallbacks = new List<Point2d>();
 
-                    // 如果后备点也在约束框外，强制拉入
-                    landing = new Point2d(
-                        Math.Max(bMinX + halfW, Math.Min(bMaxX - halfW, landing.X)),
-                        Math.Max(bMinY + textH + pad, Math.Min(bMaxY - textH - pad, landing.Y)));
-
-                    double bx = landing.X - halfW;
-                    double by = landing.Y - textH - pad;
-                    double ex = landing.X + halfW;
-                    double ey = landing.Y + textH + pad;
-
-                    AddToGrid(grid, bx, by, ex, ey, cellSz);
-                    results.Add(new PlacedLabel
+                    // 上边
+                    for (double t = 0; t <= 1; t += 0.1)
                     {
-                        Anchor = v.Point,
-                        LandingCenter = landing,
-                        BoxMinX = bx, BoxMinY = by, BoxMaxX = ex, BoxMaxY = ey,
-                        IsInsidePolygon = true
-                    });
+                        double fx = bMinX + halfW + t * (bMaxX - bMinX - 2 * halfW);
+                        fallbacks.Add(new Point2d(fx, bMaxY - textH - pad));
+                    }
+                    // 下边
+                    for (double t = 0; t <= 1; t += 0.1)
+                    {
+                        double fx = bMinX + halfW + t * (bMaxX - bMinX - 2 * halfW);
+                        fallbacks.Add(new Point2d(fx, bMinY + textH + pad));
+                    }
+                    // 左边
+                    for (double t = 0; t <= 1; t += 0.1)
+                    {
+                        double fy = bMinY + textH + pad + t * (bMaxY - bMinY - 2 * (textH + pad));
+                        fallbacks.Add(new Point2d(bMinX + halfW, fy));
+                    }
+                    // 右边
+                    for (double t = 0; t <= 1; t += 0.1)
+                    {
+                        double fy = bMinY + textH + pad + t * (bMaxY - bMinY - 2 * (textH + pad));
+                        fallbacks.Add(new Point2d(bMaxX - halfW, fy));
+                    }
+
+                    // 按离顶点的距离排序，近的优先
+                    fallbacks = fallbacks.OrderBy(p => p.GetDistanceTo(v.Point)).ToList();
+
+                    foreach (var fb in fallbacks)
+                    {
+                        double bx = fb.X - halfW;
+                        double by = fb.Y - textH - pad;
+                        double ex = fb.X + halfW;
+                        double ey = fb.Y + textH + pad;
+
+                        if (CheckCollision(grid, bx, by, ex, ey, cellSz))
+                            continue;
+
+                        AddToGrid(grid, bx, by, ex, ey, cellSz);
+                        results.Add(new PlacedLabel
+                        {
+                            Anchor = v.Point,
+                            LandingCenter = fb,
+                            BoxMinX = bx, BoxMinY = by, BoxMaxX = ex, BoxMaxY = ey,
+                            IsInsidePolygon = false
+                        });
+                        placed = true;
+                        break;
+                    }
+
+                    // 实在没有位置了，强制放
+                    if (!placed)
+                    {
+                        var center = new Point2d(
+                            (bMinX + bMaxX) * 0.5,
+                            (bMinY + bMaxY) * 0.5);
+                        double bx = center.X - halfW;
+                        double by = center.Y - textH - pad;
+                        double ex = center.X + halfW;
+                        double ey = center.Y + textH + pad;
+                        AddToGrid(grid, bx, by, ex, ey, cellSz);
+                        results.Add(new PlacedLabel
+                        {
+                            Anchor = v.Point,
+                            LandingCenter = center,
+                            BoxMinX = bx, BoxMinY = by, BoxMaxX = ex, BoxMaxY = ey,
+                            IsInsidePolygon = true
+                        });
+                    }
                 }
             }
             return results;
