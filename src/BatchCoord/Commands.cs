@@ -23,29 +23,24 @@ namespace BatchCoord
 
             try
             {
-                // 1. 选择矩形范围（边界框）
-                ed.WriteMessage("\n指定标注范围的第一角点: ");
-                var pt1Res = ed.GetPoint(new PromptPointOptions("\n指定标注范围的第一个角点: "));
-                if (pt1Res.Status != PromptStatus.OK) { ed.WriteMessage("\n已取消。"); return; }
+                // 1. 选择要标注的多段线
+                var selOpts = new PromptSelectionOptions();
+                selOpts.MessageForAdding = "\n选择要标注坐标的地块（闭合多段线）: ";
+                var filter = new SelectionFilter(new[] { new TypedValue(0, "LWPOLYLINE") });
+                var selRes = ed.GetSelection(selOpts, filter);
+                if (selRes.Status != PromptStatus.OK) { ed.WriteMessage("\n已取消。"); return; }
 
-                ed.WriteMessage("\n指定对角点: ");
-                var pt2Res = ed.GetCorner(new PromptCornerOptions("\n指定对角点: ", pt1Res.Value));
+                // 2. 指定标注文字约束范围（矩形边界，坐标标注不超出此范围）
+                ed.WriteMessage("\n指定坐标标注的约束范围 — 文字不会超出此矩形。");
+                var pt1Res = ed.GetPoint(new PromptPointOptions("\n第一角点: "));
+                if (pt1Res.Status != PromptStatus.OK) { ed.WriteMessage("\n已取消。"); return; }
+                var pt2Res = ed.GetCorner(new PromptCornerOptions("\n对角点: ", pt1Res.Value));
                 if (pt2Res.Status != PromptStatus.OK) { ed.WriteMessage("\n已取消。"); return; }
 
-                var minX = Math.Min(pt1Res.Value.X, pt2Res.Value.X);
-                var minY = Math.Min(pt1Res.Value.Y, pt2Res.Value.Y);
-                var maxX = Math.Max(pt1Res.Value.X, pt2Res.Value.X);
-                var maxY = Math.Max(pt1Res.Value.Y, pt2Res.Value.Y);
-                var boundary = new Extents2d(minX, minY, maxX, maxY);
-
-                // 2. 选择范围内的多段线
-                var filter = new SelectionFilter(new[] { new TypedValue(0, "LWPOLYLINE") });
-                var selectionRes = ed.SelectAll(filter);
-                if (selectionRes.Status != PromptStatus.OK)
-                {
-                    ed.WriteMessage("\n图中没有可用的多段线。");
-                    return;
-                }
+                double bMinX = Math.Min(pt1Res.Value.X, pt2Res.Value.X);
+                double bMinY = Math.Min(pt1Res.Value.Y, pt2Res.Value.Y);
+                double bMaxX = Math.Max(pt1Res.Value.X, pt2Res.Value.X);
+                double bMaxY = Math.Max(pt1Res.Value.Y, pt2Res.Value.Y);
 
                 // 3. 小数位数
                 int decimals = 3;
@@ -60,28 +55,24 @@ namespace BatchCoord
                 { AllowNegative = false, AllowZero = false, DefaultValue = defaultTextH });
                 double textHeight = htRes.Status == PromptStatus.OK ? htRes.Value : defaultTextH;
 
-                // 5. 提取范围内的顶点
+                // 5. 提取顶点
                 var allVerts = new List<VertexInfo>();
                 using (var tr = db.TransactionManager.StartTransaction())
                 {
-                    foreach (SelectedObject so in selectionRes.Value)
+                    foreach (SelectedObject so in selRes.Value)
                     {
                         var pl = tr.GetObject(so.ObjectId, OpenMode.ForRead) as Polyline;
                         if (pl == null || !pl.Closed) continue;
-
-                        // 检查多段线是否在矩形范围内（质心在内即可）
-                        if (!IsPolylineInBoundary(pl, boundary)) continue;
-
                         ExtractVertices(pl, allVerts);
                     }
                     tr.Commit();
                 }
 
-                if (allVerts.Count == 0) { ed.WriteMessage("\n指定范围内未找到闭合多段线。"); return; }
+                if (allVerts.Count == 0) { ed.WriteMessage("\n未选中有效的闭合多段线。"); return; }
                 ed.WriteMessage($"\n共 {allVerts.Count} 个角点，正在计算最优标注位置...");
 
-                // 6. 碰撞检测 + 放置
-                var placedLabels = PlaceLabels(allVerts, textHeight, decimals, boundary);
+                // 6. 碰撞检测 + 放置（文字被约束在 bMinX~bMaxX, bMinY~bMaxY 内）
+                var placedLabels = PlaceLabels(allVerts, textHeight, decimals, bMinX, bMinY, bMaxX, bMaxY);
 
                 // 7. 生成标注
                 int placed = 0;
@@ -104,24 +95,6 @@ namespace BatchCoord
                 ed.WriteMessage($"\n❌ 错误: {ex.Message}");
             }
         }
-
-        #region 边界检测
-
-        private bool IsPolylineInBoundary(Polyline pl, Extents2d boundary)
-        {
-            double cx = 0, cy = 0;
-            int n = pl.NumberOfVertices;
-            for (int i = 0; i < n; i++)
-            {
-                var pt = pl.GetPoint2dAt(i);
-                cx += pt.X; cy += pt.Y;
-            }
-            cx /= n; cy /= n;
-            return cx >= boundary.MinPoint.X && cx <= boundary.MaxPoint.X &&
-                   cy >= boundary.MinPoint.Y && cy <= boundary.MaxPoint.Y;
-        }
-
-        #endregion
 
         #region 顶点提取与方向计算
 
@@ -190,7 +163,8 @@ namespace BatchCoord
             }
         }
 
-        private List<PlacedLabel> PlaceLabels(List<VertexInfo> verts, double textH, int decimals, Extents2d boundary)
+        private List<PlacedLabel> PlaceLabels(List<VertexInfo> verts, double textH, int decimals,
+            double bMinX, double bMinY, double bMaxX, double bMaxY)
         {
             var dirs = new[]
             {
@@ -231,9 +205,9 @@ namespace BatchCoord
                     {
                         var tp = new Point2d(v.Point.X + sd.d.X * off, v.Point.Y + sd.d.Y * off);
 
-                        // 文字必须落在边界矩形内
-                        if (tp.X < boundary.MinPoint.X || tp.X > boundary.MaxPoint.X ||
-                            tp.Y < boundary.MinPoint.Y || tp.Y > boundary.MaxPoint.Y)
+                        // 文字必须落在约束矩形内
+                        if (tp.X < bMinX || tp.X > bMaxX ||
+                            tp.Y < bMinY || tp.Y > bMaxY)
                             continue;
 
                         double bx = sd.d.X > 0 ? tp.X : tp.X - lblW;
