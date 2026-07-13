@@ -12,7 +12,6 @@ namespace BatchCoord
     public class Commands
     {
         [CommandMethod("ZDZB")]
-        [CommandMethod("BZ")]
         public void BatchCoord()
         {
             var doc = Application.DocumentManager.MdiActiveDocument;
