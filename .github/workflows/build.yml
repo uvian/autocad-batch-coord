@@ -46,16 +46,17 @@ jobs:
       shell: pwsh
       run: |
         echo "Uploading to release: ${{ github.ref_name }} ..."
-        gh release upload "${{ github.ref_name }}" `
+        # 删除残留的 Release（如 tag 被 force-push 过），忽略错误
+        gh release delete "${{ github.ref_name }}" --repo "${{ github.repository }}" --yes 2>$null
+        # 全新创建 Release 并上传构件
+        gh release create "${{ github.ref_name }}" `
           "src/BatchCoord/bin/Release/net472/BatchCoord.dll" `
           "bundle/BatchCoord.bundle.zip" `
-          --repo "${{ github.repository }}" --clobber 2>&1
+          --repo "${{ github.repository }}" `
+          --generate-notes `
+          --target "${{ github.sha }}"
         if ($LASTEXITCODE -ne 0) {
-          gh release create "${{ github.ref_name }}" `
-            "src/BatchCoord/bin/Release/net472/BatchCoord.dll" `
-            "bundle/BatchCoord.bundle.zip" `
-            --repo "${{ github.repository }}" `
-            --generate-notes `
-            --target "${{ github.sha }}" 2>&1
+          Write-Error "Release 创建失败，退出码: $LASTEXITCODE"
+          exit $LASTEXITCODE
         }
         echo "release done"
