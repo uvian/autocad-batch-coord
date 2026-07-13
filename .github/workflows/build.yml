@@ -1,0 +1,49 @@
+name: Build AutoCAD Plugin
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+
+    - name: Restore
+      run: dotnet restore BatchCoord.sln
+
+    - name: Build
+      run: dotnet build BatchCoord.sln -c Release --no-restore
+
+    - name: Create bundle package
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path bundle\BatchCoord.bundle\Contents
+        Copy-Item src\BatchCoord\bin\Release\net472\BatchCoord.dll bundle\BatchCoord.bundle\Contents\
+        Copy-Item PackageContents.xml bundle\BatchCoord.bundle\
+        Compress-Archive -Path bundle\* -DestinationPath bundle\BatchCoord.bundle.zip
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: BatchCoord
+        path: |
+          src/BatchCoord/bin/Release/net472/BatchCoord.dll
+          bundle/BatchCoord.bundle.zip
+
+    - name: Upload to Release (tagged only)
+      if: startsWith(github.ref, 'refs/tags/v')
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release upload ${{ github.ref_name }} src/BatchCoord/bin/Release/net472/BatchCoord.dll --repo ${{ github.repository }} --clobber 2>/dev/null
+        gh release upload ${{ github.ref_name }} bundle/BatchCoord.bundle.zip --repo ${{ github.repository }} --clobber 2>/dev/null
+        echo "release upload done"

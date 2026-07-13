@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ApplicationPackage SchemaVersion="1.0"
+    Name="批量坐标标注插件"
+    Description="智能避让批量坐标标注，替代湘源控规批量坐标功能"
+    Author="uvian"
+    AppVersion="1.0.0"
+    ProductCode="{F3A2B1C4-D5E6-7890-ABCD-EF1234567890}"
+    UpgradeCode="{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}">
+
+  <RuntimeRequirements OS="Win64" Platform="AutoCAD" SeriesMin="R23.0" SeriesMax="R25.0" />
+
+  <Components Description="主程序">
+    <RuntimeRequirements OS="Win64" Platform="AutoCAD" SeriesMin="R23.0" SeriesMax="R25.0" />
+    <ComponentEntry AppName="BatchCoord" AppType=".NET" ModuleName="./Contents/BatchCoord.dll" />
+  </Components>
+</ApplicationPackage>
